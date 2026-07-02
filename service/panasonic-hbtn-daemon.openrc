@@ -1,0 +1,11 @@
+#!/sbin/openrc-run
+
+name="panasonic-hbtn-daemon"
+description="Handles Panasonic CF-19 front bezel button actions"
+command="/usr/local/bin/panasonic-hbtn-daemon.py"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+depend() {
+	need modules
+	after modules
+}
