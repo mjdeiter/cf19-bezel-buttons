@@ -26,6 +26,8 @@ Should generalize to any distro/kernel with minor path adjustments.
    reads that device directly (bypassing any X/Wayland-specific
    keysym mapping headaches) and runs real actions: lock the screen,
    rotate the display, toggle an on-screen keyboard.
+5. **Install it via DKMS, not a plain `.ko` copy** -- see the warning
+   section below. This bit us on the very first kernel upgrade.
 
 ## How we diagnosed it
 
@@ -40,6 +42,54 @@ Should generalize to any distro/kernel with minor path adjustments.
   missing config, no permissions issue, just literally no driver
   claiming that hardware.
 - Heiher's `panasonic-hbtn` project targets those exact ACPI IDs.
+
+## Use DKMS, not a plain install
+
+**Update, one kernel upgrade later:** the first version of this guide
+installed the compiled `.ko` directly into
+`/lib/modules/$(uname -r)/extra/`. That works fine until your next
+kernel upgrade -- at which point the module silently doesn't exist
+for the new kernel anymore (no error, no crash, the buttons just stop
+working again and `panasonic-hbtn-daemon` crash-loops because its
+target input device is gone). Same failure class as any other
+out-of-tree kernel module without DKMS -- it's not specific to this
+driver.
+
+**Use the DKMS setup in [`dkms/`](dkms/) instead** -- it makes the
+module rebuild itself automatically on every future kernel update via
+your distro's DKMS pacman/dpkg hooks, no manual intervention needed.
+
+```bash
+sudo pacman -S dkms          # or apt install dkms, etc.
+sudo mkdir -p /usr/src/panasonic-hbtn-1.0
+sudo cp driver/panasonic-hbtn.c dkms/dkms.conf dkms/Makefile /usr/src/panasonic-hbtn-1.0/
+sudo dkms add -m panasonic-hbtn -v 1.0
+sudo dkms build -m panasonic-hbtn -v 1.0
+sudo dkms install -m panasonic-hbtn -v 1.0
+sudo modprobe panasonic-hbtn
+```
+
+Verify your distro actually has the DKMS kernel-upgrade hook installed
+(this ships with the `dkms` package itself on most distros, nothing
+extra to configure):
+```bash
+# Arch/Artix:
+ls /usr/share/libalpm/hooks/ | grep dkms
+# Debian/Ubuntu: dkms installs a kernel postinst hook automatically,
+# check /etc/kernel/postinst.d/dkms
+```
+
+If you already did the plain-install method from an earlier version
+of this guide, clean it up first so there isn't a stale duplicate:
+```bash
+sudo rm /lib/modules/$(uname -r)/extra/panasonic-hbtn.ko*
+sudo depmod -a
+```
+
+The rest of this section (building/patching the source) is still
+relevant background if you want to understand why it needed patches
+-- the DKMS steps above use the exact same patched source, just
+managed properly.
 
 ## Building the driver
 
@@ -86,26 +136,8 @@ sudo evtest /dev/input/eventN
 # press buttons, you should see Event: ... type 1 (EV_KEY) lines
 ```
 
-### Install permanently
-
-```bash
-sudo mkdir -p /lib/modules/$(uname -r)/extra
-sudo install -m 0644 panasonic-hbtn.ko /lib/modules/$(uname -r)/extra/
-sudo depmod -a
-```
-
-**Autoload on boot -- OpenRC:**
-```bash
-echo 'modules="panasonic-hbtn"' | sudo tee -a /etc/conf.d/modules
-```
-(the `modules` OpenRC service must be in your `boot` runlevel --
-check with `rc-update show`)
-
-**Autoload on boot -- systemd** (untested on the reference system,
-but this is the standard mechanism):
-```bash
-echo panasonic-hbtn | sudo tee /etc/modules-load.d/panasonic-hbtn.conf
-```
+**For permanent installation, skip straight to the DKMS section above
+-- don't manually copy the `.ko` into `/lib/modules/`.**
 
 ## The action daemon
 
@@ -127,7 +159,10 @@ Two gotchas this script works around, worth knowing if you adapt it:
    against *your* X session. There's no reliable static path for
    this across display managers -- the script finds it by scanning
    `/proc/*/environ` for a process that already has both `DISPLAY`
-   and `XAUTHORITY` set (e.g. your window manager process).
+   and `XAUTHORITY` set (e.g. your window manager process): Note this
+   value changes every login session (a fresh `/tmp/xauth_XXXXXX`
+   file each time), which is exactly why a static path won't work --
+   the daemon has to rediscover it at runtime, every time it starts.
 2. **Detecting current rotation from `xrandr --query`**: don't just
    search the output line for the words "normal"/"right"/etc. --
    `xrandr` always prints a reference list of all four rotation names
@@ -167,6 +202,42 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 ```
+
+## If you're on LXQt: check your lock-screen shortcut too
+
+If your desktop is LXQt (its default WM is Openbox, so `ps aux` will
+just show `openbox` -- easy to miss that LXQt is actually running the
+show), check `~/.config/lxqt/globalkeyshortcuts.conf` for a
+`lockscreen` entry. By default it's often bound to something like
+`Exec=xdg-screensaver, lock`, which fails with:
+
+```
+Failed to run "xdg-screensaver lock". Ensure you have a
+locker/screensaver compatible with xdg-screensaver installed
+and running.
+```
+
+`xdg-screensaver` only knows how to drive `xscreensaver`, `xautolock`,
+or a DE-specific screensaver daemon (gnome-screensaver,
+kscreenlocker, light-locker...) -- it has no concept of a bare locker
+like `i3lock` that just runs and exits, so it fails if none of those
+are installed/running. Simplest fix, and what keeps this consistent
+with the Security-button binding above: point the shortcut at your
+locker directly instead:
+
+```
+Exec=i3lock
+```
+
+then restart `lxqt-globalkeysd` (it caches the config on launch, a
+plain file edit won't take effect until it restarts):
+```bash
+pkill lxqt-globalkeysd
+DISPLAY=:0 XAUTHORITY=<your current xauth file> lxqt-globalkeysd &
+```
+(alternative: install `light-locker` instead, which registers itself
+as `xdg-screensaver`-compatible and leaves the shortcut as-is -- more
+moving parts, but zero config changes.)
 
 ## Identifying your buttons
 
